@@ -22,6 +22,7 @@ eggs/
 .eggs/
 lib/
 lib64/
+notes.md
 outputs/
 parts/
 redundant/

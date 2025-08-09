@@ -1,7 +1,7 @@
 seed: 42
 dataset: PDB
-dataset_download_dir: /home/arin/mind_esa/data
-out_path: /home/arin/mind_esa/outputs/pdb_pretrain
+dataset_download_dir: /home/arin/mind-molecular-intelligence/data
+out_path: /home/arin/mind-molecular-intelligence/outputs/pdb_pretrain
 wandb_project_name: esa-pretraining
 wandb_run_name: pretraining-PDB-protein-yaml
 max_epochs: 200
@@ -10,7 +10,7 @@ monitor_loss_name: train_total_loss
 
 num_workers: 4
 
-protein_max_residues: 1000
+protein_max_residues: 500
 
 apply_attention_on: node
 num_features: 128
@@ -44,6 +44,6 @@ lr: 0.0001
 early_stopping_patience: 30
 optimiser_weight_decay: 0.0000000001
 
-batch_size: 6
+batch_size: 10
 
 
