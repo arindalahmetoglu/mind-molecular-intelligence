@@ -4,25 +4,75 @@ from torch_geometric.data import Data
 from torch_geometric.transforms import BaseTransform
 from typing import Optional, List, Dict, Any
 import random
+import math
 
 
 class AddRandomNoise(BaseTransform):
-    """Add random noise to 3D coordinates for coordinate denoising task"""
+    """Add random noise to 3D coordinates for coordinate denoising task.
+
+    Supports per-graph sigma sampling and emits a coordinate mask for loss.
+    """
     
-    def __init__(self, noise_std: float = 0.1, coordinate_dim: int = 3):
-        self.noise_std = noise_std
-        self.coordinate_dim = coordinate_dim
+    def __init__(
+        self,
+        noise_std: float = 0.1,
+        coordinate_dim: int = 3,
+        mask_ratio: float = 0.15,
+        sample_sigma: bool = False,
+        sigma_min: float = None,
+        sigma_max: float = None,
+    ):
+        self.noise_std = float(noise_std)
+        self.coordinate_dim = int(coordinate_dim)
+        self.mask_ratio = float(mask_ratio)
+        self.sample_sigma = bool(sample_sigma)
+        self.sigma_min = float(sigma_min) if sigma_min is not None else None
+        self.sigma_max = float(sigma_max) if sigma_max is not None else None
+    
+    def _sample_sigma(self) -> float:
+        if self.sample_sigma and self.sigma_min is not None and self.sigma_max is not None:
+            lo = max(1e-6, min(self.sigma_min, self.sigma_max))
+            hi = max(self.sigma_min, self.sigma_max)
+            u = torch.rand(())
+            sigma = float(torch.exp(torch.log(torch.tensor(lo)) + u * (torch.log(torch.tensor(hi)) - torch.log(torch.tensor(lo)))))
+            return sigma
+        return self.noise_std
     
     def __call__(self, data: Data) -> Data:
         if hasattr(data, 'pos') and data.pos is not None:
-            # Store clean coordinates
+            # Store the original, clean positions
             data.clean_pos = data.pos.clone()
+
+            # Determine the noise standard deviation for this specific graph/batch
+            current_noise_std = self.noise_std
+            if self.sigma_min is not None and self.sigma_max is not None and self.sigma_min < self.sigma_max:
+                # Sample noise_std from a log-uniform distribution for better perceptual range
+                log_min = math.log(self.sigma_min)
+                log_max = math.log(self.sigma_max)
+                current_noise_std = math.exp(random.uniform(log_min, log_max))
             
-            # Add noise to coordinates
-            noise = torch.randn_like(data.pos) * self.noise_std
-            data.pos = data.pos + noise
-        
+            # Generate and apply simple Gaussian noise
+            noise = torch.randn_like(data.pos) * current_noise_std
+            data.pos = data.pos + noise # This is now the noisy position
+            
+            # Store a coordinate mask; allow partial masking for denoising objective
+            num_nodes = data.pos.size(0)
+            if self.mask_ratio >= 1.0:
+                data.coord_mask = torch.ones(num_nodes, dtype=torch.bool)
+            else:
+                num_mask = max(1, int(num_nodes * self.mask_ratio))
+                idx = torch.randperm(num_nodes)[:num_mask]
+                mask = torch.zeros(num_nodes, dtype=torch.bool)
+                mask[idx] = True
+                data.coord_mask = mask
+            
+            # Attach the actual noise level used to the data object for the loss function
+            data.noise_std_used = torch.tensor(current_noise_std, dtype=torch.float32)
+
         return data
+
+    def __repr__(self):
+        return f'{self.__class__.__name__}(noise_std={self.noise_std}, coordinate_dim={self.coordinate_dim}, mask_ratio={self.mask_ratio})'
 
 
 class MaskAtomTypes(BaseTransform):

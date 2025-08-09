@@ -1,5 +1,6 @@
 import torch
 import math
+import random
 import numpy as np
 import pytorch_lightning as pl
 import bitsandbytes as bnb
@@ -111,41 +112,27 @@ class PretrainingConfig:
     max_neighbors: int = 32
     
     # Pretraining task configs
-    pretraining_tasks: List[str] = None  # ["coordinate_denoising", "atom_type_prediction", "bond_prediction", "distance_prediction", "angle_prediction"]
+    pretraining_tasks: List[str] = None  # ["long_range_distance", "short_range_distance", "mlm", "bond_prediction"]
     task_weights: Dict[str, float] = None
     
-    # Coordinate denoising
-    coordinate_noise_std: float = 0.1
-    coordinate_denoising_weight: float = 1.0
-    
-    # Atom type prediction
-    atom_type_prediction_weight: float = 1.0
-    atom_type_mask_ratio: float = 0.15
-    
-    # Bond prediction
-    bond_prediction_weight: float = 1.0
-    bond_mask_ratio: float = 0.15
+
     
     # Distance prediction
     distance_prediction_weight: float = 1.0
     distance_bins: int = 64
     max_distance: float = 10.0
     
-    # Angle prediction
-    angle_prediction_weight: float = 1.0
-    angle_bins: int = 36
+
     
     # Masked language modeling
     mlm_weight: float = 1.0
     mlm_mask_ratio: float = 0.15
     
-    # Contrastive learning
-    contrastive_weight: float = 1.0
+    # Temperature for softmax (used in distance prediction)
     temperature: float = 0.1
     
-    # Graph-level tasks
-    graph_property_prediction_weight: float = 1.0
-    graph_property_types: List[str] = None  # ["molecular_weight", "logp", "tpsa", etc.]
+    # Dataset caching control
+    use_dataset_cache: bool = True  # Whether to use cached processed datasets
     
     def __post_init__(self):
         if self.hidden_dims is None:
@@ -155,20 +142,14 @@ class PretrainingConfig:
         if self.layer_types is None:
             self.layer_types = ["S", "S", "S", "P"]
         if self.pretraining_tasks is None:
-            self.pretraining_tasks = ["coordinate_denoising", "atom_type_prediction", "bond_prediction"]
+            self.pretraining_tasks = ["long_range_distance", "short_range_distance", "mlm"]
         if self.task_weights is None:
             self.task_weights = {
-                "coordinate_denoising": 1.0,
-                "atom_type_prediction": 1.0,
-                "bond_prediction": 1.0,
-                "distance_prediction": 1.0,
-                "angle_prediction": 1.0,
-                "mlm": 1.0,
-                "contrastive": 1.0,
-                "graph_property": 1.0
+                "long_range_distance": 1.5,
+                "short_range_distance": 1.0,
+                "mlm": 0.3
             }
-        if self.graph_property_types is None:
-            self.graph_property_types = ["molecular_weight", "logp", "tpsa"]
+
 
 
 def nearest_multiple_of_8(n):
@@ -194,7 +175,8 @@ class MultiDomainEncoder(nn.Module):
                 K=config.gaussian_kernels,
                 edge_types=config.atom_types * config.atom_types
             )
-            self.coordinate_projection = nn.Linear(config.gaussian_kernels, config.hidden_dims[0])
+            # 5 invariant features + gaussian_kernels edge features
+            self.coordinate_projection = nn.Linear(5 + config.gaussian_kernels, config.hidden_dims[0])
         
         # Position encodings
         self.rwse_encoder = None
@@ -205,14 +187,19 @@ class MultiDomainEncoder(nn.Module):
             self.lap_encoder = LapPENodeEncoder()
     
     def _create_molecule_encoder(self):
-        """Create encoder for small molecules"""
+        """Create encoder for small molecules with reliable atomic features"""
+        # Just atomic number embedding + period (most reliable features)
+        self.atom_embedding = nn.Embedding(self.config.atom_types, self.config.hidden_dims[0] - 8)
+        self.period_embedding = nn.Embedding(8, 8)  # Period is very reliable (1-7)
+        
         return nn.Sequential(
-            nn.Embedding(self.config.atom_types, self.config.hidden_dims[0]),
+            nn.Linear(self.config.hidden_dims[0], self.config.hidden_dims[0]),
+            nn.ReLU(),
             nn.Linear(self.config.hidden_dims[0], self.config.hidden_dims[0])
         )
     
     def _create_protein_encoder(self):
-        """Create encoder for proteins"""
+        """Create simple encoder for proteins (fallback only)"""
         return nn.Sequential(
             nn.Embedding(self.config.amino_acid_types, self.config.hidden_dims[0]),
             nn.Linear(self.config.hidden_dims[0], self.config.hidden_dims[0])
@@ -248,13 +235,21 @@ class MultiDomainEncoder(nn.Module):
         
         # For QM9, x might be atomic numbers (z) instead of features
         if domain_type == "molecule" and x.dtype == torch.long:
-            # Use atomic numbers directly for embedding
-            encoded = self.molecule_encoder(x)
+            # Use atomic numbers with rich chemical features
+            encoded = self._encode_molecule_features(x)
         elif domain_type == "molecule":
-            # Use features if available
-            encoded = self.molecule_encoder(x)
+            # Use features if available, but enhance with chemical properties
+            if x.dtype == torch.long:
+                encoded = self._encode_molecule_features(x)
+            else:
+                # If x is already feature-based, use molecule encoder
+                encoded = self.molecule_encoder(x)
         elif domain_type == "protein":
-            encoded = self.protein_encoder(x)
+            # Proteins actually use atomic elements, same as molecules
+            if x.dtype == torch.long:
+                encoded = self._encode_molecule_features(x)  # Use molecular encoding for atoms
+            else:
+                encoded = self.protein_encoder(x)
         elif domain_type == "rna":
             encoded = self.rna_encoder(x)
         elif domain_type == "metabolite":
@@ -285,22 +280,159 @@ class MultiDomainEncoder(nn.Module):
         
         return encoded
     
+    def _encode_molecule_features(self, atomic_numbers):
+        """Encode atomic numbers with reliable chemical features"""
+        # Simple, reliable period mapping for common atoms
+        period_map = {
+            1: 1,   # H
+            6: 2, 7: 2, 8: 2, 9: 2,    # C, N, O, F (period 2)
+            15: 3, 16: 3, 17: 3,       # P, S, Cl (period 3)
+        }
+        
+        device = atomic_numbers.device
+        
+        # Main atomic embeddings
+        atom_emb = self.atom_embedding(atomic_numbers)
+        
+        # Simple period feature (very reliable)
+        periods = torch.tensor([period_map.get(z.item(), 0) for z in atomic_numbers], device=device)
+        period_emb = self.period_embedding(periods)
+        
+        # Concatenate features
+        combined_features = torch.cat([
+            atom_emb,      # [batch_size, hidden_dim-8]
+            period_emb,    # [batch_size, 8]
+        ], dim=-1)       # [batch_size, hidden_dim]
+        
+        # Pass through molecule encoder
+        return self.molecule_encoder(combined_features)
+    
+
+    
+    def _compute_chemical_coordination(self, x_dense, batch):
+        """Compute true chemical coordination numbers from molecular graph topology"""
+        try:
+            # Get dimensions first (always needed)
+            batch_size = x_dense.size(0)
+            max_nodes = x_dense.size(1)
+            device = x_dense.device
+            
+            # Try to get edge_index from batch data
+            if hasattr(batch, 'edge_index') and batch.edge_index is not None:
+                from torch_scatter import scatter_add
+                
+                edge_index = batch.edge_index
+                batch_idx = getattr(batch, 'batch', None)
+                
+                if batch_idx is not None:
+                    # ✅ ROBUST: Handle bidirectional edges correctly
+                    # Only count unique edges by keeping edges where src < dst
+                    src, dst = edge_index[0], edge_index[1]
+                    
+                    # Create unique edge mask (avoid double counting)
+                    unique_edge_mask = src < dst  # Only count edge (i,j) if i < j
+                    if unique_edge_mask.sum() == 0:
+                        # If no edges satisfy src < dst, edges might be unidirectional already
+                        unique_edge_mask = torch.ones_like(src, dtype=torch.bool)
+                    
+                    unique_src = src[unique_edge_mask]
+                    unique_dst = dst[unique_edge_mask]
+                    
+                    # Count coordination for each node
+                    num_nodes = len(batch_idx)
+                    coordination_sparse = torch.zeros(num_nodes, device=device, dtype=torch.float)
+                    
+                    # Each unique edge contributes 1 to both src and dst coordination
+                    coordination_sparse.scatter_add_(0, unique_src, torch.ones_like(unique_src, dtype=torch.float))
+                    coordination_sparse.scatter_add_(0, unique_dst, torch.ones_like(unique_dst, dtype=torch.float))
+                    
+                    # Convert to dense format [batch_size, max_nodes]
+                    coordination_dense = torch.zeros(batch_size, max_nodes, device=device)
+                    
+                    # Fill dense tensor using batch indices
+                    node_idx = 0
+                    for graph_idx in range(batch_size):
+                        nodes_in_graph = (batch_idx == graph_idx).sum().item()
+                        if nodes_in_graph > 0:
+                            end_idx = node_idx + nodes_in_graph
+                            actual_nodes = min(nodes_in_graph, max_nodes)
+                            coordination_dense[graph_idx, :actual_nodes] = coordination_sparse[node_idx:node_idx + actual_nodes]
+                        node_idx += nodes_in_graph
+                    
+                    return coordination_dense
+                else:
+                    # Single graph case - simpler
+                    src, dst = edge_index[0], edge_index[1]
+                    unique_edge_mask = src < dst
+                    if unique_edge_mask.sum() == 0:
+                        unique_edge_mask = torch.ones_like(src, dtype=torch.bool)
+                    
+                    unique_src = src[unique_edge_mask]
+                    unique_dst = dst[unique_edge_mask]
+                    
+                    coordination = torch.zeros(max_nodes, device=device, dtype=torch.float)
+                    coordination.scatter_add_(0, unique_src, torch.ones_like(unique_src, dtype=torch.float))
+                    coordination.scatter_add_(0, unique_dst, torch.ones_like(unique_dst, dtype=torch.float))
+                    
+                    return coordination.unsqueeze(0).expand(batch_size, -1)
+            else:
+                # No edge information available, return zeros
+                return torch.zeros(batch_size, max_nodes, device=x_dense.device)
+                
+        except Exception as e:
+            # Fallback: return zeros if anything goes wrong
+            print(f"Warning: Could not compute chemical coordination: {e}")
+            return torch.zeros(x_dense.size(0), x_dense.size(1), device=x_dense.device)
+    
     def _compute_geometric_features(self, x, pos, batch):
-        """Compute 3D geometric features using Gaussian basis functions"""
+        """Compute SE(3) invariant geometric features"""
         # Convert to dense format (let to_dense_batch pick the correct max per-batch)
         x_dense, batch_mask = to_dense_batch(x, batch, fill_value=0)
         pos_dense, _ = to_dense_batch(pos, batch, fill_value=0)
         
         n_graph, n_node = x_dense.size()
         
-        # Compute pairwise distances
+        # SE(3) INVARIANT: Compute pairwise distances only
         delta_pos = pos_dense.unsqueeze(1) - pos_dense.unsqueeze(2)
-        dist = delta_pos.norm(dim=-1)
+        dist = delta_pos.norm(dim=-1)  # INVARIANT to rotation/translation
+    
+        # SE(3) INVARIANT: Node-level coordination features
+        # 1. Distance-based neighbors (local environment density)
+        # Use tighter cutoffs that are more chemically meaningful
+        close_cutoff = 3.0   # First coordination shell (~typical bond + van der Waals)
+        medium_cutoff = self.config.cutoff_distance if hasattr(self.config, 'cutoff_distance') else 6.0
         
-        # Compute edge types
+        # Count neighbors in different shells
+        close_mask = (dist < close_cutoff) & (dist > 0.5)     # Close neighbors (likely bonded)
+        medium_mask = (dist < medium_cutoff) & (dist > 0.5)   # Medium range (environment)
+        
+        close_coordination = close_mask.sum(dim=-1).float()    # [n_graph, n_node]
+        distance_based_coordination = medium_mask.sum(dim=-1).float()  # [n_graph, n_node]
+        
+        # 2. Chemical bond-based coordination (true molecular graph neighbors)
+        # We'll compute this from the actual molecular graph structure if available
+        chemical_coordination = self._compute_chemical_coordination(x_dense, batch)
+        
+        # SE(3) INVARIANT: Distance statistics per node
+        # Use close_mask for meaningful distance statistics
+        masked_dist = dist.masked_fill(~close_mask, float('inf'))
+        min_distances = masked_dist.min(dim=-1)[0].masked_fill(close_mask.sum(dim=-1) == 0, 0.0)
+        
+        masked_dist_finite = dist.masked_fill(~close_mask, 0.0)
+        mean_distances = masked_dist_finite.sum(dim=-1) / (close_mask.sum(dim=-1) + 1e-8)
+        
+        # SE(3) INVARIANT: Combine features
+        # Shape: [n_graph, n_node, feature_dim]
+        invariant_features = torch.stack([
+            chemical_coordination,        # True chemical bonds (sp3≈4, sp2≈3, sp≈2)
+            close_coordination,          # Close spatial neighbors (~3Å, likely bonded)
+            distance_based_coordination,  # Medium range environment (~6Å)
+            min_distances,               # Closest neighbor distance
+            mean_distances,              # Average close neighbor distance
+        ], dim=-1)  # [n_graph, n_node, 5]
+        
+        # Apply Gaussian basis functions to distances for richer representation
         edge_type = x_dense.view(n_graph, n_node, 1) * self.config.atom_types + x_dense.view(n_graph, 1, n_node)
-        
-        # Apply Gaussian basis functions
         gbf_feature = self.gaussian_layer(dist, edge_type)
         
         # Mask padding
@@ -309,8 +441,17 @@ class MultiDomainEncoder(nn.Module):
             padding_mask.unsqueeze(1).unsqueeze(-1), 0.0
         )
         
+        # Aggregate edge features (sum over neighbors is permutation invariant)
+        aggregated_edge_features = edge_features.sum(dim=-2)  # [n_graph, n_node, gaussian_kernels]
+        
+        # Combine invariant node features with aggregated edge features
+        combined_features = torch.cat([
+            invariant_features,  # [n_graph, n_node, 5]
+            aggregated_edge_features  # [n_graph, n_node, gaussian_kernels]
+        ], dim=-1)  # [n_graph, n_node, 5 + gaussian_kernels]
+        
         # Project to hidden dimension
-        geometric_features = self.coordinate_projection(edge_features.sum(dim=-2))
+        geometric_features = self.coordinate_projection(combined_features)
         
         # Convert back to sparse format
         geometric_features = geometric_features[batch_mask]
@@ -326,51 +467,23 @@ class PretrainingTasks(nn.Module):
         self.config = config
         
         # Task-specific heads
-        self.coordinate_denoising_head = self._create_coordinate_denoising_head()
-        self.atom_type_head = self._create_atom_type_head()
-        self.bond_head = self._create_bond_head()
-        self.distance_head = self._create_distance_head()
-        self.angle_head = self._create_angle_head()
+        self.long_range_distance_head = self._create_long_range_distance_head()
+        self.distance_head = self._create_distance_head()  # Used by short_range_distance
         self.mlm_head = self._create_mlm_head()
-        self.graph_property_head = self._create_graph_property_head()
-        
-        # Contrastive learning
-        self.contrastive_projection = nn.Sequential(
-            nn.Linear(config.graph_dim, config.graph_dim),
-            nn.ReLU(),
-            nn.Linear(config.graph_dim, 128)
-        )
     
-    def _create_coordinate_denoising_head(self):
-        """Head for coordinate denoising task"""
-        return nn.Sequential(
-            nn.Linear(self.config.graph_dim, self.config.graph_dim // 2),
-            nn.ReLU(),
-            nn.Linear(self.config.graph_dim // 2, self.config.coordinate_dim)
-        )
-    
-    def _create_atom_type_head(self):
-        """Head for atom type prediction"""
-        max_types = max(
-            self.config.atom_types,
-            self.config.amino_acid_types,
-            self.config.nucleotide_types,
-            self.config.metabolite_atom_types
-        )
-        return nn.Sequential(
-            nn.Linear(self.config.graph_dim, self.config.graph_dim // 2),
-            nn.ReLU(),
-            nn.Linear(self.config.graph_dim // 2, max_types)
-        )
-    
-    def _create_bond_head(self):
-        """Head for bond prediction"""
+    def _create_long_range_distance_head(self):
+        """Head for long-range distance prediction (global 3D structure learning)"""
+        # Use classification like the working distance_prediction_loss
         return nn.Sequential(
             nn.Linear(self.config.graph_dim * 2, self.config.graph_dim),
             nn.ReLU(),
-            nn.Linear(self.config.graph_dim, self.config.bond_types)
-        )
-    
+            nn.Dropout(0.1),
+            nn.Linear(self.config.graph_dim, self.config.graph_dim // 2),
+            nn.ReLU(),
+            nn.Linear(self.config.graph_dim // 2, self.config.distance_bins)  # Classify into distance bins
+        )    
+
+
     def _create_distance_head(self):
         """Head for distance prediction"""
         return nn.Sequential(
@@ -379,14 +492,7 @@ class PretrainingTasks(nn.Module):
             nn.Linear(self.config.graph_dim, self.config.distance_bins)
         )
     
-    def _create_angle_head(self):
-        """Head for angle prediction"""
-        return nn.Sequential(
-            nn.Linear(self.config.graph_dim * 3, self.config.graph_dim),
-            nn.ReLU(),
-            nn.Linear(self.config.graph_dim, self.config.angle_bins)
-        )
-    
+
     def _create_mlm_head(self):
         """Head for masked language modeling"""
         max_types = max(
@@ -401,41 +507,102 @@ class PretrainingTasks(nn.Module):
             nn.Linear(self.config.graph_dim // 2, max_types)
         )
     
-    def _create_graph_property_head(self):
-        """Head for graph property prediction"""
-        num_properties = len(self.config.graph_property_types)
-        return nn.Sequential(
-            nn.Linear(self.config.graph_dim, self.config.graph_dim // 2),
-            nn.ReLU(),
-            nn.Linear(self.config.graph_dim // 2, num_properties)
+
+
+    def long_range_distance_loss(self, node_embeddings, data):
+        """
+        Long-range distance prediction loss for global 3D structure learning.
+        
+        Predicts distances between all atom pairs (or sampled pairs for large proteins)
+        to learn overall molecular geometry. This is completely SE(3) invariant.
+        """
+        if not hasattr(data, 'pos') or data.pos is None:
+            return torch.tensor(0.0, device=node_embeddings.device, requires_grad=True)
+        
+        pos = data.pos
+        num_atoms = pos.size(0)
+        
+        # For efficiency with large proteins, sample pairs
+        max_pairs = min(2000, num_atoms * (num_atoms - 1) // 2)
+        
+        if num_atoms <= 50:
+            # Small molecules: use all pairs
+            i_indices, j_indices = torch.triu_indices(
+                num_atoms, num_atoms, offset=1, device=node_embeddings.device
+            )
+        else:
+            # Large proteins: intelligent sampling strategy
+            pairs = []
+            
+            # 1. Sample local pairs (distance < 8.0 Å) - most important for structure
+            with torch.no_grad():
+                dist_matrix = torch.cdist(pos, pos)
+                local_mask = (dist_matrix < 8.0) & (dist_matrix > 0)
+                local_i, local_j = torch.where(local_mask)
+                # Keep upper triangular
+                valid_local = local_i < local_j
+                local_pairs = list(zip(local_i[valid_local].tolist(), local_j[valid_local].tolist()))
+                pairs.extend(local_pairs[:max_pairs//2])  # Half for local pairs
+            
+            # 2. Sample global pairs for long-range structure
+            remaining = max_pairs - len(pairs)
+            if remaining > 0:
+                for _ in range(remaining):
+                    i, j = torch.randint(0, num_atoms, (2,)).tolist()
+                    if i != j:
+                        pairs.append((min(i, j), max(i, j)))
+            
+            # Remove duplicates and convert to tensors
+            pairs = list(set(pairs))[:max_pairs]
+            if pairs:
+                i_indices, j_indices = zip(*pairs)
+                i_indices = torch.tensor(i_indices, device=node_embeddings.device)
+                j_indices = torch.tensor(j_indices, device=node_embeddings.device)
+            else:
+                return torch.tensor(0.0, device=node_embeddings.device, requires_grad=True)
+        
+        if len(i_indices) == 0:
+            return torch.tensor(0.0, device=node_embeddings.device, requires_grad=True)
+        
+        # Get node embeddings for pairs
+        emb_i = node_embeddings[i_indices]
+        emb_j = node_embeddings[j_indices]
+        pair_embeddings = torch.cat([emb_i, emb_j], dim=-1)
+        
+        # Predict distance bins using long-range distance head
+        distance_logits = self.long_range_distance_head(pair_embeddings)
+        
+        # True distances (SE(3) invariant ground truth)
+        pos_i = pos[i_indices]
+        pos_j = pos[j_indices]
+        true_distances = torch.norm(pos_i - pos_j, dim=1)
+        
+        # Convert distances to bins (same as distance_prediction_loss)
+        distance_bins = torch.clamp(
+            (true_distances / self.config.max_distance * self.config.distance_bins).long(),
+            0, self.config.distance_bins - 1
         )
-    
-    def coordinate_denoising_loss(self, node_embeddings, noisy_pos, clean_pos, mask):
-        """Compute coordinate denoising loss"""
-        predicted_delta = self.coordinate_denoising_head(node_embeddings)
-        target_delta = clean_pos - noisy_pos
         
-        loss = F.mse_loss(predicted_delta[mask], target_delta[mask], reduction='mean')
-        return loss
-    
-    def atom_type_prediction_loss(self, node_embeddings, atom_types, mask):
-        """Compute atom type prediction loss"""
-        logits = self.atom_type_head(node_embeddings)
-        loss = F.cross_entropy(logits[mask], atom_types[mask], reduction='mean')
-        return loss
-    
-    def bond_prediction_loss(self, node_embeddings, edge_index, bond_types, mask):
-        """Compute bond prediction loss"""
-        source_emb = node_embeddings[edge_index[0]]
-        target_emb = node_embeddings[edge_index[1]]
-        edge_emb = torch.cat([source_emb, target_emb], dim=-1)
+        # Debug: Check predictions occasionally
+        with torch.no_grad():
+            pred_bins = distance_logits.argmax(dim=-1)
+            true_mean = true_distances.mean().item()
+            pred_dist_mean = (pred_bins.float() / self.config.distance_bins * self.config.max_distance).mean().item()
+            
+            # Log debug info occasionally
+            if torch.rand(1).item() < 0.01:  # 1% chance to log
+                print(f"SE3 Debug - True dist: {true_mean:.3f}Å, Pred dist: {pred_dist_mean:.3f}Å")
         
-        logits = self.bond_head(edge_emb)
-        loss = F.cross_entropy(logits[mask], bond_types[mask], reduction='mean')
+        # Use cross-entropy loss (same as distance_prediction_loss)
+        loss = F.cross_entropy(distance_logits, distance_bins, reduction='mean')
+        
         return loss
     
-    def distance_prediction_loss(self, node_embeddings, edge_index, distances, mask):
-        """Compute distance prediction loss"""
+
+    
+
+    def short_range_distance_loss(self, node_embeddings, edge_index, distances, mask):
+        """Compute short-range distance loss (local chemical bonds)"""
         source_emb = node_embeddings[edge_index[0]]
         target_emb = node_embeddings[edge_index[1]]
         edge_emb = torch.cat([source_emb, target_emb], dim=-1)
@@ -451,51 +618,33 @@ class PretrainingTasks(nn.Module):
         loss = F.cross_entropy(logits[mask], distance_bins[mask], reduction='mean')
         return loss
     
-    def angle_prediction_loss(self, node_embeddings, angle_indices, angles, mask):
-        """Compute angle prediction loss"""
-        node1_emb = node_embeddings[angle_indices[:, 0]]
-        node2_emb = node_embeddings[angle_indices[:, 1]]
-        node3_emb = node_embeddings[angle_indices[:, 2]]
-        angle_emb = torch.cat([node1_emb, node2_emb, node3_emb], dim=-1)
-        
-        logits = self.angle_head(angle_emb)
-        
-        # Convert angles to bins
-        angle_bins = torch.clamp(
-            (angles / (2 * np.pi) * self.config.angle_bins).long(),
-            0, self.config.angle_bins - 1
-        )
-        
-        loss = F.cross_entropy(logits[mask], angle_bins[mask], reduction='mean')
-        return loss
-    
-    def mlm_loss(self, node_embeddings, original_types, masked_types, mask):
-        """Compute masked language modeling loss"""
+
+    def mlm_loss(self, node_embeddings, data):
+        """
+        Compute masked language modeling loss
+        """
+        if not (hasattr(data, 'mlm_mask') and hasattr(data, 'original_types') and hasattr(data, 'masked_types')):
+            return torch.tensor(0.0, device=node_embeddings.device)
+
+        mask = data.mlm_mask
+        original_types = data.original_types
+        masked_types = getattr(data, 'masked_types', original_types)
+
+        # Debug logging (remove after confirming)
+        if hasattr(self, '_step_count'):
+            self._step_count += 1
+        else:
+            self._step_count = 1
+            
+        if self._step_count % 100 == 1:  # Log every 100 steps
+            mask_ratio = mask.sum().item() / mask.size(0)
+            print(f"MLM Debug - Step {self._step_count}: Mask ratio = {mask_ratio:.3f}, Masked nodes = {mask.sum().item()}/{mask.size(0)}")
+
         logits = self.mlm_head(node_embeddings)
         loss = F.cross_entropy(logits[mask], original_types[mask], reduction='mean')
         return loss
     
-    def contrastive_loss(self, graph_embeddings, temperature=0.1):
-        """Compute contrastive learning loss"""
-        # Project to contrastive space
-        projections = self.contrastive_projection(graph_embeddings)
-        projections = F.normalize(projections, dim=-1)
-        
-        # Compute similarity matrix
-        similarity_matrix = torch.matmul(projections, projections.T) / temperature
-        
-        # Create positive pairs (same graph, different augmentations)
-        batch_size = graph_embeddings.size(0)
-        labels = torch.arange(batch_size, device=graph_embeddings.device)
-        
-        loss = F.cross_entropy(similarity_matrix, labels, reduction='mean')
-        return loss
-    
-    def graph_property_loss(self, graph_embeddings, properties):
-        """Compute graph property prediction loss"""
-        logits = self.graph_property_head(graph_embeddings)
-        loss = F.mse_loss(logits, properties, reduction='mean')
-        return loss
+
 
 
 class PretrainingESAModel(pl.LightningModule):
@@ -571,6 +720,11 @@ class PretrainingESAModel(pl.LightningModule):
         self.train_metrics = defaultdict(list)
         self.val_metrics = defaultdict(list)
         self.test_metrics = defaultdict(list)
+
+        # If we are in node-attention mode and need per-node outputs for a node-level task
+        # (e.g., coordinate denoising), ensure we align ESA outputs back to node space.
+        if self.config.apply_attention_on == "node":
+            self.config.is_node_task = True
     
     def forward(self, batch, domain_type="molecule"):
         """
@@ -670,7 +824,8 @@ class PretrainingESAModel(pl.LightningModule):
             h, dense_batch_index = to_dense_batch(h, batch_mapping, fill_value=0, max_num_nodes=num_max_items)
             h = self.esa_backbone(h, edge_index, batch_mapping, num_max_items=num_max_items)
             
-            if self.config.is_node_task:
+            if self.config.is_node_task and h.dim() == 3:
+                # Map dense ESA outputs back to the original node ordering only if ESA kept per-node outputs
                 h = h[dense_batch_index]
         
         return h, node_embeddings
@@ -678,95 +833,35 @@ class PretrainingESAModel(pl.LightningModule):
     def _compute_pretraining_losses(self, batch, graph_embeddings, node_embeddings):
         """Compute all pretraining task losses"""
         losses = {}
-        total_loss = 0.0
+        total_loss = 0.0               
+
+        # Long-range distance learning (global 3D structure)
+        if "long_range_distance" in self.config.pretraining_tasks:
+            losses['long_range_distance'] = self.pretraining_tasks.long_range_distance_loss(node_embeddings, batch)
+            total_loss += self.config.task_weights['long_range_distance'] * losses['long_range_distance']
         
-        # Coordinate denoising
-        if "coordinate_denoising" in self.config.pretraining_tasks:
-            if hasattr(batch, 'pos') and hasattr(batch, 'clean_pos'):
-                mask = torch.rand(batch.pos.size(0)) < 0.15  # 15% masking ratio
-                coord_loss = self.pretraining_tasks.coordinate_denoising_loss(
-                    node_embeddings, batch.pos, batch.clean_pos, mask
+        # Short-range distance learning (local chemical bonds)
+        if "short_range_distance" in self.config.pretraining_tasks:
+            if hasattr(batch, 'edge_index') and hasattr(batch, 'pos'):
+                # Compute distances from coordinates on-the-fly
+                edge_index = batch.edge_index
+                pos = batch.pos
+                distances = torch.norm(pos[edge_index[1]] - pos[edge_index[0]], dim=1)
+                
+                mask = torch.rand(edge_index.size(1)) < 0.15
+                dist_loss = self.pretraining_tasks.short_range_distance_loss(
+                    node_embeddings, edge_index, distances, mask
                 )
-                losses['coordinate_denoising'] = coord_loss
-                total_loss += self.config.task_weights['coordinate_denoising'] * coord_loss
+                losses['short_range_distance'] = dist_loss
+                total_loss += self.config.task_weights['short_range_distance'] * dist_loss
         
-        # Atom type prediction
-        if "atom_type_prediction" in self.config.pretraining_tasks:
-            # Use atomic numbers (z) for atom type prediction
-            if hasattr(batch, 'z') and batch.z is not None:
-                atom_types = batch.z
-                mask = torch.rand(atom_types.size(0)) < self.config.atom_type_mask_ratio
-                atom_loss = self.pretraining_tasks.atom_type_prediction_loss(
-                    node_embeddings, atom_types, mask
-                )
-                losses['atom_type_prediction'] = atom_loss
-                total_loss += self.config.task_weights['atom_type_prediction'] * atom_loss
-        
-        # Bond prediction
-        if "bond_prediction" in self.config.pretraining_tasks:
-            if hasattr(batch, 'bond_types') and hasattr(batch, 'edge_index'):
-                mask = torch.rand(batch.edge_index.size(1)) < self.config.bond_mask_ratio
-                bond_loss = self.pretraining_tasks.bond_prediction_loss(
-                    node_embeddings, batch.edge_index, batch.bond_types, mask
-                )
-                losses['bond_prediction'] = bond_loss
-                total_loss += self.config.task_weights['bond_prediction'] * bond_loss
-        
-        # Distance prediction
-        if "distance_prediction" in self.config.pretraining_tasks:
-            if hasattr(batch, 'distances') and hasattr(batch, 'edge_index'):
-                mask = torch.rand(batch.edge_index.size(1)) < 0.15
-                dist_loss = self.pretraining_tasks.distance_prediction_loss(
-                    node_embeddings, batch.edge_index, batch.distances, mask
-                )
-                losses['distance_prediction'] = dist_loss
-                total_loss += self.config.task_weights['distance_prediction'] * dist_loss
-        
-        # Angle prediction
-        if "angle_prediction" in self.config.pretraining_tasks:
-            if hasattr(batch, 'angles') and hasattr(batch, 'angle_indices'):
-                mask = torch.rand(batch.angle_indices.size(0)) < 0.15
-                angle_loss = self.pretraining_tasks.angle_prediction_loss(
-                    node_embeddings, batch.angle_indices, batch.angles, mask
-                )
-                losses['angle_prediction'] = angle_loss
-                total_loss += self.config.task_weights['angle_prediction'] * angle_loss
-        
+
         # Masked language modeling
         if "mlm" in self.config.pretraining_tasks:
-            if hasattr(batch, 'original_types') and (hasattr(batch, 'mlm_mask') or hasattr(batch, 'masked_types')):
-                # Prefer the exact mask used in the transform if available
-                if hasattr(batch, 'mlm_mask') and batch.mlm_mask is not None:
-                    mask = batch.mlm_mask
-                else:
-                    if hasattr(batch, 'z') and batch.z is not None:
-                        num_nodes = batch.z.size(0)
-                    else:
-                        num_nodes = batch.x.size(0)
-                    mask = torch.rand(num_nodes) < self.config.mlm_mask_ratio
-                mlm_loss = self.pretraining_tasks.mlm_loss(
-                    node_embeddings, batch.original_types, getattr(batch, 'masked_types', batch.original_types), mask
-                )
-                losses['mlm'] = mlm_loss
-                total_loss += self.config.task_weights['mlm'] * mlm_loss
+            losses['mlm'] = self.pretraining_tasks.mlm_loss(node_embeddings, batch)
+            total_loss += self.config.task_weights['mlm'] * losses['mlm']
         
-        # Contrastive learning
-        if "contrastive" in self.config.pretraining_tasks:
-            contrastive_loss = self.pretraining_tasks.contrastive_loss(
-                graph_embeddings, self.config.temperature
-            )
-            losses['contrastive'] = contrastive_loss
-            total_loss += self.config.task_weights['contrastive'] * contrastive_loss
-        
-        # Graph property prediction
-        if "graph_property" in self.config.pretraining_tasks:
-            if hasattr(batch, 'graph_properties'):
-                graph_prop_loss = self.pretraining_tasks.graph_property_loss(
-                    graph_embeddings, batch.graph_properties
-                )
-                losses['graph_property'] = graph_prop_loss
-                total_loss += self.config.task_weights['graph_property'] * graph_prop_loss
-        
+
         return losses, total_loss
     
     def training_step(self, batch, batch_idx):
@@ -775,9 +870,17 @@ class PretrainingESAModel(pl.LightningModule):
         
         losses, total_loss = self._compute_pretraining_losses(batch, graph_embeddings, node_embeddings)
         
-        # Log individual losses
+        # Log individual losses with more detailed info
         for task_name, loss_value in losses.items():
             self.log(f"train_{task_name}_loss", loss_value, prog_bar=True)
+            # Also log to console occasionally for debugging
+            if batch_idx % 50 == 0:
+                print(f"  {task_name}: {loss_value:.4f}")
+        
+        # Print detailed loss breakdown occasionally
+        if batch_idx % 50 == 0:
+            loss_str = " | ".join([f"{k}: {v:.4f}" for k, v in losses.items()])
+            print(f"Step {batch_idx} - {loss_str} | Total: {total_loss:.4f}")
         
         self.log("train_total_loss", total_loss, prog_bar=True)
         
@@ -813,27 +916,35 @@ class PretrainingESAModel(pl.LightningModule):
     
     def configure_optimizers(self):
         """Configure optimizers and schedulers"""
+        # Simple optimizer setup for all parameters
         optimizer = bnb.optim.AdamW8bit(
             self.parameters(),
             lr=self.config.lr,
-            weight_decay=self.config.optimiser_weight_decay
+            weight_decay=self.config.optimiser_weight_decay,
         )
-        
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode="min",
-            factor=0.5,
-            patience=self.config.early_stopping_patience // 2,
-            verbose=True
-        )
-        
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {
+
+        # Cosine with warmup
+        total_epochs = getattr(self.config, 'max_epochs', 100)
+        warmup_frac = 0.1
+        warmup_epochs = max(1, int(total_epochs * warmup_frac))
+
+        def lr_lambda(current_epoch: int):
+            if current_epoch < warmup_epochs:
+                return float(current_epoch + 1) / float(warmup_epochs)
+            # Cosine decay from 1.0 to 0.1 over the remaining epochs
+            progress = (current_epoch - warmup_epochs) / max(1, (total_epochs - warmup_epochs))
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return 0.1 + 0.9 * cosine
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
+
+        return [optimizer], [
+            {
                 "scheduler": scheduler,
+                "interval": "epoch",
                 "monitor": self.config.monitor_loss_name,
-            },
         }
+        ]
     
     def get_embeddings(self, batch, domain_type="molecule"):
         """Get embeddings for downstream tasks"""
@@ -870,20 +981,16 @@ if __name__ == "__main__":
         
         # Pretraining tasks
         pretraining_tasks=[
-            "coordinate_denoising",
-            "atom_type_prediction", 
-            "bond_prediction",
-            "distance_prediction",
-            "contrastive"
+            "long_range_distance",
+            "short_range_distance",
+            "mlm"
         ],
         
         # Task weights
         task_weights={
-            "coordinate_denoising": 1.0,
-            "atom_type_prediction": 1.0,
-            "bond_prediction": 1.0,
-            "distance_prediction": 0.5,
-            "contrastive": 0.1
+            "long_range_distance": 1.5,
+            "short_range_distance": 1.0,
+            "mlm": 0.3
         },
         
         # Training parameters

@@ -50,61 +50,18 @@ def create_pretraining_data_transforms(config: PretrainingConfig):
     """Create data transforms for pretraining tasks"""
     # Use the dedicated pretraining transforms module
     from data_loading.pretraining_transforms import (
-        AddRandomNoise,
         MaskAtomTypes,
-        MaskBondTypes,
-        AddDistanceFeatures,
-        AddAngleFeatures,
-        AddGraphProperties,
-        CreateMaskedPairs,
     )
     
     transforms = []
     
-    # Coordinate denoising transform
-    if "coordinate_denoising" in config.pretraining_tasks:
-        transforms.append(AddRandomNoise(
-            noise_std=config.coordinate_noise_std,
-            coordinate_dim=config.coordinate_dim
-        ))
+
     
     # Atom type masking for MLM
-    if "atom_type_prediction" in config.pretraining_tasks or "mlm" in config.pretraining_tasks:
+    if "mlm" in config.pretraining_tasks:
         transforms.append(MaskAtomTypes(
-            mask_ratio=config.atom_type_mask_ratio,
+            mask_ratio=config.mlm_mask_ratio,
             mask_token=0  # Assuming 0 is the mask token
-        ))
-    
-    # Bond type masking
-    if "bond_prediction" in config.pretraining_tasks:
-        transforms.append(MaskBondTypes(
-            mask_ratio=config.bond_mask_ratio,
-            mask_token=0
-        ))
-    
-    # Distance features
-    if "distance_prediction" in config.pretraining_tasks:
-        transforms.append(AddDistanceFeatures(
-            max_distance=config.max_distance,
-            distance_bins=config.distance_bins
-        ))
-    
-    # Angle features
-    if "angle_prediction" in config.pretraining_tasks:
-        transforms.append(AddAngleFeatures(
-            angle_bins=config.angle_bins
-        ))
-    
-    # Graph properties
-    if "graph_property" in config.pretraining_tasks:
-        transforms.append(AddGraphProperties(
-            property_types=config.graph_property_types
-        ))
-    
-    # Contrastive learning pairs
-    if "contrastive" in config.pretraining_tasks:
-        transforms.append(CreateMaskedPairs(
-            mask_ratio=config.mlm_mask_ratio
         ))
     
     return transforms
@@ -123,6 +80,21 @@ def load_multi_domain_dataset(config: PretrainingConfig, dataset_name: str, data
         if dataset_name == "QM9":
             # Prefer ESA3DQM9Dataset with 3D coordinates for pretraining
             dataset_root = os.path.join(dataset_dir, 'qm9_dataset')
+            
+            # Handle cache control for QM9
+            if not getattr(config, 'use_dataset_cache', True):
+                # Clear cached QM9 processed files to force re-processing
+                processed_dir = os.path.join(dataset_root, 'processed')
+                if os.path.exists(processed_dir):
+                    import glob
+                    cache_files = glob.glob(os.path.join(processed_dir, '*.pt'))
+                    for cache_file in cache_files:
+                        try:
+                            os.remove(cache_file)
+                            print(f"Removed cached QM9 file: {os.path.basename(cache_file)}")
+                        except Exception as e:
+                            print(f"Could not remove {cache_file}: {e}")
+            
             # Apply pretraining transforms so required fields (clean_pos, masked types, distances, etc.) exist
             # ESA3DQM9Dataset caches processed tensors; if present, it will be reused
             ds = ESA3DQM9Dataset(root=dataset_root, transform=Compose(transforms) if len(transforms) > 0 else None)
@@ -148,6 +120,21 @@ def load_multi_domain_dataset(config: PretrainingConfig, dataset_name: str, data
         domain_type = "protein"
         from data.efficient_molecular_datasets import ESA3DPDBDataset
         dataset_root = os.path.join(dataset_dir, 'pdb_dataset' if dataset_name == "PDB" else 'afdb_dataset')
+        
+        # Handle cache control
+        if not getattr(config, 'use_dataset_cache', True):
+            # Clear cached processed files to force re-processing
+            processed_dir = os.path.join(dataset_root, 'processed')
+            if os.path.exists(processed_dir):
+                import glob
+                cache_files = glob.glob(os.path.join(processed_dir, 'esa3d_pdb_max_atoms_*.pt'))
+                for cache_file in cache_files:
+                    try:
+                        os.remove(cache_file)
+                        print(f"🗑️  Removed cached file: {os.path.basename(cache_file)}")
+                    except Exception as e:
+                        print(f"⚠️  Could not remove {cache_file}: {e}")
+        
         # Allow limiting atom count via config if provided
         max_atoms = getattr(config, 'protein_max_residues', 2000)
         ds = ESA3DPDBDataset(
@@ -248,6 +235,8 @@ def main():
     parser.add_argument("--config-json-path", type=str, help="Path to JSON config file")
     parser.add_argument("--config-yaml-path", type=str, help="Path to YAML config file")
     parser.add_argument("--wandb-project-name", type=str, default="esa-pretraining", help="WandB project name")
+    parser.add_argument("--use-dataset-cache", action="store_true", default=True, help="Use cached processed datasets")
+    parser.add_argument("--no-dataset-cache", dest="use_dataset_cache", action="store_false", help="Force re-processing, ignore cached datasets")
     
     # Model architecture arguments
     parser.add_argument("--num-features", type=int, default=128, help="Number of input features")
@@ -268,14 +257,13 @@ def main():
     
     # Pretraining task arguments
     parser.add_argument("--pretraining-tasks", type=str, nargs="+", 
-                       default=["coordinate_denoising", "atom_type_prediction", "bond_prediction"],
+                       default=["long_range_distance", "short_range_distance", "mlm"],
                        help="Pretraining tasks to use")
     parser.add_argument("--task-weights", type=float, nargs="+", 
                        default=[1.0, 1.0, 1.0], help="Weights for pretraining tasks")
     
     # Domain-specific arguments
     parser.add_argument("--atom-types", type=int, default=119, help="Number of atom types")
-    parser.add_argument("--bond-types", type=int, default=4, help="Number of bond types")
     parser.add_argument("--amino-acid-types", type=int, default=20, help="Number of amino acid types")
     parser.add_argument("--nucleotide-types", type=int, default=4, help="Number of nucleotide types")
     parser.add_argument("--metabolite-atom-types", type=int, default=50, help="Number of metabolite atom types")
@@ -287,13 +275,10 @@ def main():
     parser.add_argument("--max-neighbors", type=int, default=32, help="Maximum number of neighbors")
     
     # Task-specific arguments
-    parser.add_argument("--coordinate-noise-std", type=float, default=0.1, help="Coordinate noise standard deviation")
-    parser.add_argument("--atom-type-mask-ratio", type=float, default=0.15, help="Atom type masking ratio")
-    parser.add_argument("--bond-mask-ratio", type=float, default=0.15, help="Bond masking ratio")
     parser.add_argument("--distance-bins", type=int, default=64, help="Number of distance bins")
-    parser.add_argument("--angle-bins", type=int, default=36, help="Number of angle bins")
+    parser.add_argument("--max-distance", type=float, default=10.0, help="Maximum distance for binning")
     parser.add_argument("--mlm-mask-ratio", type=float, default=0.15, help="MLM masking ratio")
-    parser.add_argument("--temperature", type=float, default=0.1, help="Temperature for contrastive learning")
+    parser.add_argument("--temperature", type=float, default=0.1, help="Temperature for softmax")
     
     # ESA-specific arguments
     parser.add_argument("--xformers-or-torch-attn", type=str, default="xformers", choices=["xformers", "torch"], help="Attention implementation")
@@ -386,7 +371,6 @@ def main():
             
             # Domain specific
             atom_types=args.atom_types,
-            bond_types=args.bond_types,
             amino_acid_types=args.amino_acid_types,
             nucleotide_types=args.nucleotide_types,
             metabolite_atom_types=args.metabolite_atom_types,
@@ -402,13 +386,13 @@ def main():
             task_weights=task_weights_dict,
             
             # Task specific
-            coordinate_noise_std=args.coordinate_noise_std,
-            atom_type_mask_ratio=args.atom_type_mask_ratio,
-            bond_mask_ratio=args.bond_mask_ratio,
             distance_bins=args.distance_bins,
-            angle_bins=args.angle_bins,
+            max_distance=args.max_distance,
             mlm_mask_ratio=args.mlm_mask_ratio,
             temperature=args.temperature,
+            
+            # Dataset control
+            use_dataset_cache=args.use_dataset_cache,
         )
     
     # Set seed

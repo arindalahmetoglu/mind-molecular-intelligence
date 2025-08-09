@@ -8,42 +8,53 @@ max_epochs: 200
 gradient_clip_val: 0.5
 monitor_loss_name: train_total_loss
 
-num_workers: 4
-
+num_workers: 4   
 protein_max_residues: 500
+
+use_dataset_cache: false
 
 apply_attention_on: node
 num_features: 128
 graph_dim: 256
 edge_dim: 64
-hidden_dims: [256, 256, 256, 256]
-num_heads: [8, 8, 8, 8]
-layer_types: ["M", "M", "S", "P"]
+hidden_dims: [256, 256, 256, 256, 256, 256, 256, 256]
+num_heads: [16, 16, 16, 16, 16, 16, 16, 16]
+layer_types: ["M", "S", "M", "S", "M", "S", "P", "P"]
 xformers_or_torch_attn: torch
 norm_type: LN
 use_3d_coordinates: true
 
+# MLP config
+use_mlps: true
+mlp_hidden_size: 512
+num_mlp_layers: 3
+mlp_type: standard
+mlp_dropout: 0.0
+use_mlp_ln: false
+pre_or_post: pre
+use_bfloat16: true
+
 gaussian_kernels: 128
 cutoff_distance: 6.0
 max_neighbors: 64
+max_distance: 80.0  # Further increased for large protein distances
+distance_bins: 80  # More bins for better resolution
 
 use_bfloat16: false
 
-pretraining_tasks: ["coordinate_denoising", "mlm", "contrastive","distance_prediction"]
+pretraining_tasks: ["long_range_distance", "short_range_distance", "mlm"]
 task_weights:
-  coordinate_denoising: 1.0
-  mlm: 1.0
-  contrastive: 0.5
-  distance_prediction: 0.5
+  long_range_distance: 1.5   # Global 3D structure learning (all atom pairs)
+  short_range_distance: 1.0  # Local chemical bond learning (bonded pairs)
+  mlm: 0.3                  
 
-coordinate_noise_std: 0.1
-mlm_mask_ratio: 0.15
+mlm_mask_ratio: 0.5
 temperature: 0.2
 
-lr: 0.0001
+lr: 0.0005
 early_stopping_patience: 30
 optimiser_weight_decay: 0.0000000001
 
-batch_size: 10
+batch_size: 8
 
 

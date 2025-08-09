@@ -9,6 +9,9 @@ out_path: /home/arin/mind_esa/outputs/qm9_pretrain_yaml
 wandb_project_name: esa-pretraining
 wandb_run_name: pretraining-QM9-molecule-yaml
 
+
+use_dataset_cache: true 
+
 # Model dimensions
 num_features: 128
 graph_dim: 256
