@@ -1,0 +1,86 @@
+# YAML configuration for ESA pretraining (QM9 small molecules)
+
+seed: 42
+
+dataset: QM9  # change to PDB to test proteins
+dataset_download_dir: /home/arin/mind_esa/data
+out_path: /home/arin/mind_esa/outputs/qm9_pretrain_yaml
+
+wandb_project_name: esa-pretraining
+wandb_run_name: pretraining-QM9-molecule-yaml
+
+# Model dimensions
+num_features: 128
+graph_dim: 256
+edge_dim: 128
+hidden_dims: [256, 256, 256, 256, 256, 256, 256, 256]
+num_heads: [16, 16, 16, 16, 16, 16, 16, 16]
+layer_types: ["M", "M", "M", "M", "M", "S", "P", "S"]
+apply_attention_on: edge
+
+# Attention impl and dropouts
+xformers_or_torch_attn: torch
+sab_dropout: 0.0
+mab_dropout: 0.0
+pma_dropout: 0.0
+attn_residual_dropout: 0.0
+pma_residual_dropout: 0.0
+norm_type: LN
+
+# MLP config
+use_mlps: true
+mlp_hidden_size: 512
+num_mlp_layers: 3
+mlp_type: standard
+mlp_dropout: 0.0
+use_mlp_ln: false
+pre_or_post: pre
+use_bfloat16: true
+
+# Domain sizes
+monitor_loss_name: val_total_loss
+atom_types: 119
+bond_types: 4
+molecule_max_atoms: 2000
+
+# 3D features
+use_3d_coordinates: true
+coordinate_dim: 3
+gaussian_kernels: 128
+cutoff_distance: 5.0
+max_neighbors: 32
+
+# Tasks
+pretraining_tasks: ["coordinate_denoising", "atom_type_prediction", "distance_prediction", "mlm", "contrastive"]
+task_weights:
+  coordinate_denoising: 1.5
+  atom_type_prediction: 0.2
+  # Skip bonds for now
+  bond_prediction: 0.0
+  distance_prediction: 1.0
+  mlm: 0.5
+  contrastive: 0.1
+
+# Task-specific params
+coordinate_noise_std: 0.4
+atom_type_mask_ratio: 0.3
+bond_mask_ratio: 0.25
+distance_bins: 64
+max_distance: 10.0
+mlm_mask_ratio: 0.3
+temperature: 0.1
+
+# Training
+batch_size: 1536
+lr: 0.0005
+early_stopping_patience: 30
+gradient_clip_val: 0.5
+optimiser_weight_decay: 0.0000000001
+max_epochs: 100
+num_workers: 8
+
+# Debug controls
+debug_subset_n: null
+debug_verbose: false
+
+
